@@ -1,0 +1,2 @@
+[console_scripts]
+pyfuse = pyfuse.cli:main

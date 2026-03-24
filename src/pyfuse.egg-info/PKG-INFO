@@ -1,0 +1,85 @@
+Metadata-Version: 2.4
+Name: pyfuse
+Version: 0.1.0
+Summary: First-pass Earth Engine filesystem service primitives.
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: earthengine-api
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Provides-Extra: fuse
+Requires-Dist: fusepy; extra == "fuse"
+
+# pyfuse (first pass)
+
+This repository contains a first-pass Python implementation of the design in
+`EE_FUSE_DESIGN_FIRST_PASS.md`.
+
+It focuses on filesystem-like semantics over an abstract Earth Engine backend:
+
+- deterministic path resolution
+- node metadata model
+- directory listing with TTL cache
+- collection-as-directory behavior
+- read-only `.meta.json` virtual file generation
+- namespace mutations (`mkdir`, `rename`, `unlink`, `rmdir`) through backend hooks
+
+This is a service-layer implementation meant to back a FUSE adapter in a later
+iteration.
+
+## Quick start
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+pytest
+```
+
+## Run the CLI
+
+The package includes a runnable CLI with a demo in-memory backend:
+
+```bash
+python -m pyfuse ls /ee/projects/demo/assets/monthly_s2
+python -m pyfuse stat /ee/projects/demo/assets/monthly_s2
+python -m pyfuse meta /ee/projects/demo/assets/monthly_s2
+```
+
+You can also install the command entrypoint:
+
+```bash
+pip install -e .
+pyfuse ls /ee/projects/demo/assets/monthly_s2
+```
+
+## Use Real Earth Engine Assets
+
+Authenticate once (if needed):
+
+```bash
+earthengine authenticate
+```
+
+Then run commands against your live assets:
+
+```bash
+export EE_PROJECT="your-project-id"
+python -m pyfuse ls --backend ee --project "$EE_PROJECT" /ee/projects/"$EE_PROJECT"/assets
+python -m pyfuse ls --backend ee --project "$EE_PROJECT" /ee/catalog
+python -m pyfuse meta --backend ee --project "$EE_PROJECT" /ee/projects/"$EE_PROJECT"/assets
+```
+
+You can omit `--project` if `EE_PROJECT` is set.
+
+## Optional FUSE mount
+
+`mount` is available when `fusepy` is installed:
+
+```bash
+pip install -e ".[fuse]"
+pyfuse mount /tmp/ee-mount --foreground
+```
+
+On macOS you may need a FUSE provider (for example macFUSE) available to the
+system.

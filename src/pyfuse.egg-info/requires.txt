@@ -1,0 +1,7 @@
+earthengine-api
+
+[dev]
+pytest>=8.0
+
+[fuse]
+fusepy
