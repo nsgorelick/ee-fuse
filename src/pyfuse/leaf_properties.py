@@ -19,7 +19,3 @@ def leaf_properties_payload_bytes(metadata: dict[str, Any] | None, stable_id: st
         if md.get(key) is not None:
             body[key] = md[key]
     return (json.dumps(body, indent=2, sort_keys=True) + "\n").encode("utf-8")
-
-
-def leaf_properties_payload_size_hint(metadata: dict[str, Any] | None, stable_id: str) -> int:
-    return len(leaf_properties_payload_bytes(metadata, stable_id))

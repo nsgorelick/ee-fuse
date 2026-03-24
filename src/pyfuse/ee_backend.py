@@ -46,7 +46,7 @@ from urllib.request import urlopen
 from .backend import Backend
 from .cache import TtlCache
 from .errors import eacces, eagain, enoent, enotdir, enotsup
-from .leaf_properties import leaf_properties_payload_size_hint
+from .leaf_properties import leaf_properties_payload_bytes
 from .models import Node, NodePermissions, NodeTimestamps, NodeType
 from .paths import is_fuse_client_sidecar_path, normalize_path, split_parent
 
@@ -484,7 +484,7 @@ class EarthEngineBackend(Backend):
             "properties": asset.get("properties", {}),
         }
         stable_id = asset.get("name", path)
-        metadata["_properties_size_hint"] = leaf_properties_payload_size_hint(metadata, stable_id)
+        metadata["_properties_size_hint"] = len(leaf_properties_payload_bytes(metadata, stable_id))
         return Node(
             node_type=node_type,
             display_name=_basename(path),
@@ -797,7 +797,7 @@ class EarthEngineBackend(Backend):
             ),
             metadata={
                 **child_metadata,
-                "_properties_size_hint": leaf_properties_payload_size_hint(child_metadata, stable_id),
+                "_properties_size_hint": len(leaf_properties_payload_bytes(child_metadata, stable_id)),
             },
             etag_or_version=child.get("updateTime", "v0"),
         )

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pyfuse.backend import InMemoryBackend
-from pyfuse.leaf_properties import leaf_properties_payload_size_hint
+from pyfuse.leaf_properties import leaf_properties_payload_bytes
 from pyfuse.errors import FuseError
 from pyfuse.models import Node, NodePermissions, NodeType
 from pyfuse.paths import is_fuse_client_sidecar_path, normalize_path
@@ -51,9 +51,8 @@ def test_properties_size_hint_matches_leaf_payload_bytes() -> None:
     """EE st_size hint must include trailing newline so cat/mount reads match payload."""
     leaf = _seed_nodes()[3]
     md = dict(leaf.metadata or {})
-    hint = leaf_properties_payload_size_hint(md, leaf.stable_id)
     payload = PyFuseService._leaf_properties_payload(leaf)
-    assert hint == len(payload)
+    assert len(leaf_properties_payload_bytes(md, leaf.stable_id)) == len(payload)
     assert payload.endswith(b"\n")
 
 
