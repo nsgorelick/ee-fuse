@@ -90,12 +90,51 @@ def test_meta_read_produces_json_payload() -> None:
 
 def test_cat_leaf_reads_properties_json() -> None:
     service = PyFuseService(InMemoryBackend(_seed_nodes()))
-    st = service.getattr("/ee/projects/demo/assets/tile_001")
-    assert st["st_size"] > 0
-    data = service.read("/ee/projects/demo/assets/tile_001", size=st["st_size"], offset=0)
+    service.getattr("/ee/projects/demo/assets/tile_001")
+    data = service.read("/ee/projects/demo/assets/tile_001", size=4096, offset=0)
     assert b'"properties"' in data
     assert b'"foo"' in data
     assert b'"asset_id"' in data
+
+
+def test_getattr_uses_precomputed_leaf_size_hint() -> None:
+    nodes = _seed_nodes()
+    image = nodes[4]
+    hinted = Node(
+        node_type=image.node_type,
+        display_name=image.display_name,
+        canonical_path=image.canonical_path,
+        stable_id=image.stable_id,
+        parent_stable_id=image.parent_stable_id,
+        permissions=image.permissions,
+        timestamps=image.timestamps,
+        metadata={**image.metadata, "_properties_size_hint": 123},
+        etag_or_version=image.etag_or_version,
+    )
+    nodes[4] = hinted
+    service = PyFuseService(InMemoryBackend(nodes))
+    st = service.getattr("/ee/projects/demo/assets/tile_001")
+    assert st["st_size"] == 123
+
+
+def test_getattr_ignores_remote_size_bytes_for_json_property_view() -> None:
+    nodes = _seed_nodes()
+    image = nodes[4]
+    sized = Node(
+        node_type=image.node_type,
+        display_name=image.display_name,
+        canonical_path=image.canonical_path,
+        stable_id=image.stable_id,
+        parent_stable_id=image.parent_stable_id,
+        permissions=image.permissions,
+        timestamps=image.timestamps,
+        metadata={**image.metadata, "sizeBytes": "987654", "_properties_size_hint": 10},
+        etag_or_version=image.etag_or_version,
+    )
+    nodes[4] = sized
+    service = PyFuseService(InMemoryBackend(nodes))
+    st = service.getattr("/ee/projects/demo/assets/tile_001")
+    assert st["st_size"] == 10
 
 
 def test_mkdir_and_rename_roundtrip() -> None:
@@ -110,3 +149,11 @@ def test_mkdir_and_rename_roundtrip() -> None:
     )
     listing = service.readdir("/ee/projects/demo/assets")
     assert "renamed_folder" in listing
+
+
+def test_getattr_includes_time_fields() -> None:
+    service = PyFuseService(InMemoryBackend(_seed_nodes()))
+    st = service.getattr("/ee/projects/demo/assets/tile_001")
+    assert "st_mtime" in st
+    assert "st_ctime" in st
+    assert st["st_mtime"] >= 0

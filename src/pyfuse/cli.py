@@ -58,11 +58,21 @@ def cmd_cat(args: argparse.Namespace) -> int:
     """Read leaf asset property JSON (same bytes as `cat` on a mounted image/table)."""
     svc = _build_service(args)
     svc.open_for_read(args.path)
-    st = svc.getattr(args.path)
-    size = int(st.get("st_size", 0))
-    data = svc.read(args.path, size=max(size, 1), offset=0)
-    sys.stdout.buffer.write(data)
-    if data and not data.endswith(b"\n"):
+    # Always stream to avoid allocating based on st_size, which may reflect
+    # remote asset sizeBytes (not the property-view JSON payload length).
+    offset = 0
+    chunk_size = 64 * 1024
+    last_chunk = b""
+    while True:
+        chunk = svc.read(args.path, size=chunk_size, offset=offset)
+        if not chunk:
+            break
+        sys.stdout.buffer.write(chunk)
+        offset += len(chunk)
+        last_chunk = chunk
+        if len(chunk) < chunk_size:
+            break
+    if last_chunk and not last_chunk.endswith(b"\n"):
         sys.stdout.buffer.write(b"\n")
     return 0
 

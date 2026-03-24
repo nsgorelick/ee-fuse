@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import stat
 from dataclasses import asdict
+from datetime import datetime
 from typing import Any
 
 from .backend import Backend
@@ -29,21 +30,30 @@ class PyFuseService:
         self._node_cache: TtlCache[Node] = TtlCache(metadata_ttl_seconds)
         self._listing_cache: TtlCache[list[Node]] = TtlCache(listing_ttl_seconds)
         self._listing_page_index: dict[str, dict[str, str]] = {}
+        # Path -> serialized property payload size for leaf nodes.
+        self._leaf_size_cache: TtlCache[int] = TtlCache(metadata_ttl_seconds)
 
     def getattr(self, path: str) -> dict[str, Any]:
         path = normalize_path(path)
         if is_meta_path(path):
             owner = self._get_node(owning_node_path(path))
             data = self._meta_json(owner)
-            return self._file_stat(len(data))
+            return self._file_stat(len(data), node=owner)
 
         node = self._get_node(path)
         if node.is_directory_like:
-            return self._dir_stat()
+            return self._dir_stat(node=node)
         if self._is_properties_readable_leaf(node):
-            payload = self._leaf_properties_payload(node)
-            return self._file_stat(size=len(payload))
-        return self._file_stat(size=0)
+            cached_size = self._leaf_size_cache.get(path)
+            if cached_size is not None:
+                return self._file_stat(size=cached_size, node=node)
+            hint = (node.metadata or {}).get("_properties_size_hint")
+            if isinstance(hint, int) and hint >= 0:
+                self._leaf_size_cache.put(path, hint)
+                return self._file_stat(size=hint, node=node)
+            # Lazy fallback: avoid serializing payload on getattr cold path.
+            return self._file_stat(size=0, node=node)
+        return self._file_stat(size=0, node=node)
 
     def readdir(self, path: str, offset: int = 0, limit: int | None = None) -> list[str]:
         path = normalize_path(path)
@@ -93,6 +103,7 @@ class PyFuseService:
         node = self._get_node(path)
         if self._is_properties_readable_leaf(node):
             payload = self._leaf_properties_payload(node)
+            self._leaf_size_cache.put(path, len(payload))
             return payload[offset : offset + size]
         raise enoent("read not supported for this path")
 
@@ -142,6 +153,7 @@ class PyFuseService:
         self._listing_cache.invalidate(path)
         parent = path.rsplit("/", 1)[0] or "/"
         self._listing_cache.invalidate(parent)
+        self._leaf_size_cache.invalidate(path)
         stale_pages = [k for k in self._listing_page_index if k.startswith(path) or k.startswith(parent)]
         for stale in stale_pages:
             self._listing_page_index.pop(stale, None)
@@ -206,6 +218,22 @@ class PyFuseService:
         return json.dumps(body, indent=2, sort_keys=True).encode("utf-8")
 
     @staticmethod
+    def _metadata_size_bytes(node: Node) -> int | None:
+        value = (node.metadata or {}).get("sizeBytes")
+        if value is None:
+            return None
+        if isinstance(value, int):
+            return value if value >= 0 else None
+        if isinstance(value, str):
+            try:
+                parsed = int(value)
+            except ValueError:
+                return None
+            return parsed if parsed >= 0 else None
+        return None
+
+
+    @staticmethod
     def _meta_json(node: Node) -> bytes:
         body = {
             "node_type": node.node_type.value,
@@ -224,17 +252,38 @@ class PyFuseService:
         return json.dumps(body, indent=2, sort_keys=True).encode("utf-8")
 
     @staticmethod
-    def _dir_stat() -> dict[str, Any]:
+    def _to_epoch(value: datetime | None) -> float:
+        if value is None:
+            return 0.0
+        return value.timestamp()
+
+    @classmethod
+    def _time_fields(cls, node: Node | None) -> dict[str, float]:
+        if node is None:
+            return {"st_atime": 0.0, "st_mtime": 0.0, "st_ctime": 0.0}
+        mtime = cls._to_epoch(node.timestamps.updated)
+        ctime = cls._to_epoch(node.timestamps.created)
+        atime = mtime if mtime else ctime
+        return {
+            "st_atime": atime,
+            "st_mtime": mtime,
+            "st_ctime": ctime,
+        }
+
+    @classmethod
+    def _dir_stat(cls, node: Node | None = None) -> dict[str, Any]:
         return {
             "st_mode": stat.S_IFDIR | 0o555,
             "st_nlink": 2,
             "st_size": 0,
+            **cls._time_fields(node),
         }
 
-    @staticmethod
-    def _file_stat(size: int) -> dict[str, Any]:
+    @classmethod
+    def _file_stat(cls, size: int, node: Node | None = None) -> dict[str, Any]:
         return {
             "st_mode": stat.S_IFREG | 0o444,
             "st_nlink": 1,
             "st_size": size,
+            **cls._time_fields(node),
         }
