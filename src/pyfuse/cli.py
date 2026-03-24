@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 from typing import Any
@@ -10,6 +11,24 @@ from .demo import build_demo_backend
 from .ee_backend import EarthEngineBackend
 from .errors import FuseError
 from .service import PyFuseService
+
+_LOG_LEVEL_CHOICES = frozenset(
+    ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"),
+)
+
+
+def _resolve_log_level(args: argparse.Namespace) -> str:
+    """Effective log level: CLI flag > PYFUSE_LOG_LEVEL > mount=DEBUG else WARNING."""
+    if args.log_level is not None:
+        return str(args.log_level).upper()
+    env = os.getenv("PYFUSE_LOG_LEVEL")
+    if env:
+        u = env.strip().upper()
+        if u in _LOG_LEVEL_CHOICES:
+            return u
+    if args.command == "mount":
+        return "DEBUG"
+    return "WARNING"
 
 
 def _build_service(args: argparse.Namespace) -> PyFuseService:
@@ -58,8 +77,7 @@ def cmd_cat(args: argparse.Namespace) -> int:
     """Read leaf asset property JSON (same bytes as `cat` on a mounted image/table)."""
     svc = _build_service(args)
     svc.open_for_read(args.path)
-    # Always stream to avoid allocating based on st_size, which may reflect
-    # remote asset sizeBytes (not the property-view JSON payload length).
+    # Stream in chunks instead of sizing one big buffer from getattr.
     offset = 0
     chunk_size = 64 * 1024
     last_chunk = b""
@@ -106,6 +124,10 @@ def cmd_mount(args: argparse.Namespace) -> int:
         os.environ["FUSE_LIBRARY_PATH"] = args.fuse_library
     try:
         from fuse import FUSE, FuseOSError, Operations  # type: ignore
+
+        from .fuse_readdir import offset_aware_fuse_subclass
+
+        FUSE = offset_aware_fuse_subclass(FUSE)
     except Exception:
         print("fusepy not installed. Install with: pip install fusepy", file=sys.stderr)
         return 2
@@ -113,6 +135,9 @@ def cmd_mount(args: argparse.Namespace) -> int:
     class _Ops(Operations):
         def __init__(self, ns: argparse.Namespace) -> None:
             self.svc = _build_service(ns)
+            self._fh_seq = 1
+            self._fh_paths: dict[int, str] = {}
+            self._write_handles: set[int] = set()
 
         def getattr(self, path: str, fh: int | None = None) -> dict[str, Any]:
             try:
@@ -126,20 +151,57 @@ def cmd_mount(args: argparse.Namespace) -> int:
             except FuseError as exc:
                 raise FuseOSError(exc.code)
 
-        def open(self, path: str, flags: int) -> int:
-            if flags & (os.O_WRONLY | os.O_RDWR):
-                raise FuseOSError(30)  # EROFS
+        def iter_readdir(self, path: str, fh: int, after_off: int):
             try:
-                self.svc.open_for_read(path)
+                yield from self.svc.iter_readdir(path, fh, after_off)
             except FuseError as exc:
                 raise FuseOSError(exc.code)
-            return 0
+
+        def open(self, path: str, flags: int) -> int:
+            fh = self._fh_seq
+            self._fh_seq += 1
+            try:
+                if flags & (os.O_WRONLY | os.O_RDWR):
+                    self.svc.open_for_write(path, fh=fh)
+                    self._write_handles.add(fh)
+                else:
+                    self.svc.open_for_read(path)
+                self._fh_paths[fh] = path
+            except FuseError as exc:
+                raise FuseOSError(exc.code)
+            return fh
 
         def read(self, path: str, size: int, offset: int, fh: int) -> bytes:
             try:
                 return self.svc.read(path, size=size, offset=offset)
             except FuseError as exc:
                 raise FuseOSError(exc.code)
+
+        def write(self, path: str, data: bytes, offset: int, fh: int) -> int:
+            try:
+                return self.svc.write(path, fh=fh, offset=offset, data=data)
+            except FuseError as exc:
+                raise FuseOSError(exc.code)
+
+        def truncate(self, path: str, length: int, fh: int | None = None) -> int:
+            if fh is None:
+                raise FuseOSError(22)  # EINVAL
+            try:
+                self.svc.truncate(path, fh=fh, length=length)
+            except FuseError as exc:
+                raise FuseOSError(exc.code)
+            return 0
+
+        def release(self, path: str, fh: int) -> int:
+            try:
+                if fh in self._write_handles:
+                    self.svc.release_write(path, fh=fh)
+            except FuseError as exc:
+                raise FuseOSError(exc.code)
+            finally:
+                self._write_handles.discard(fh)
+                self._fh_paths.pop(fh, None)
+            return 0
 
         def mkdir(self, path: str, mode: int) -> int:
             try:
@@ -169,12 +231,23 @@ def cmd_mount(args: argparse.Namespace) -> int:
                 raise FuseOSError(exc.code)
             return 0
 
-    FUSE(_Ops(args), args.mountpoint, foreground=args.foreground, nothreads=True)
+    FUSE(_Ops(args), args.mountpoint, foreground=args.foreground, nothreads=True)  # type: ignore[misc]
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pyfuse", description="pyfuse first-pass CLI")
+    parser.add_argument(
+        "--log-level",
+        default=None,
+        choices=sorted(_LOG_LEVEL_CHOICES),
+        metavar="LEVEL",
+        help=(
+            "Logging verbosity. Omit to use PYFUSE_LOG_LEVEL, else mount uses DEBUG "
+            "and other subcommands use WARNING. "
+            "Place before the subcommand (e.g. pyfuse --log-level INFO mount …)."
+        ),
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     def add_backend_args(cmd: argparse.ArgumentParser) -> None:
@@ -208,7 +281,7 @@ def build_parser() -> argparse.ArgumentParser:
     ls = sub.add_parser("ls", help="List directory entries")
     add_backend_args(ls)
     ls.add_argument("path")
-    ls.add_argument("--limit", type=int, default=256)
+    ls.add_argument("--limit", type=int, default=1000)
     ls.set_defaults(func=cmd_ls)
 
     st = sub.add_parser("stat", help="Show stat-like attributes")
@@ -260,6 +333,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    level_name = _resolve_log_level(args)
+    logging.basicConfig(
+        level=getattr(logging, level_name, logging.WARNING),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     try:
         return args.func(args)
     except FuseError as exc:

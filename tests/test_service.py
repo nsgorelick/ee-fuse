@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pyfuse.backend import InMemoryBackend
+from pyfuse.errors import FuseError
 from pyfuse.models import Node, NodePermissions, NodeType
 from pyfuse.service import PyFuseService
 
@@ -90,11 +91,13 @@ def test_meta_read_produces_json_payload() -> None:
 
 def test_cat_leaf_reads_properties_json() -> None:
     service = PyFuseService(InMemoryBackend(_seed_nodes()))
-    service.getattr("/ee/projects/demo/assets/tile_001")
+    st = service.getattr("/ee/projects/demo/assets/tile_001")
+    assert st["st_size"] > 0
     data = service.read("/ee/projects/demo/assets/tile_001", size=4096, offset=0)
     assert b'"properties"' in data
     assert b'"foo"' in data
     assert b'"asset_id"' in data
+    assert data.endswith(b"\n")
 
 
 def test_getattr_uses_precomputed_leaf_size_hint() -> None:
@@ -157,3 +160,64 @@ def test_getattr_includes_time_fields() -> None:
     assert "st_mtime" in st
     assert "st_ctime" in st
     assert st["st_mtime"] >= 0
+
+
+def test_write_properties_json_updates_leaf_properties() -> None:
+    nodes = _seed_nodes()
+    image = nodes[4]
+    nodes[4] = Node(
+        node_type=image.node_type,
+        display_name=image.display_name,
+        canonical_path=image.canonical_path,
+        stable_id=image.stable_id,
+        parent_stable_id=image.parent_stable_id,
+        permissions=NodePermissions(read=True, write_metadata=True, delete=True),
+        timestamps=image.timestamps,
+        metadata=image.metadata,
+        etag_or_version=image.etag_or_version,
+    )
+    service = PyFuseService(InMemoryBackend(nodes))
+    path = "/ee/projects/demo/assets/tile_001"
+    fh = 42
+    service.open_for_write(path, fh=fh)
+    payload = (
+        b'{\n'
+        b'  "asset_id": "ignored",\n'
+        b'  "properties": {"foo": "baz", "new_key": 7},\n'
+        b'  "type": "Image"\n'
+        b'}\n'
+    )
+    service.truncate(path, fh=fh, length=0)
+    service.write(path, fh=fh, offset=0, data=payload)
+    service.release_write(path, fh=fh)
+    data = service.read(path, size=4096, offset=0)
+    assert b'"foo": "baz"' in data
+    assert b'"new_key": 7' in data
+
+
+def test_write_rejects_system_properties() -> None:
+    nodes = _seed_nodes()
+    image = nodes[4]
+    nodes[4] = Node(
+        node_type=image.node_type,
+        display_name=image.display_name,
+        canonical_path=image.canonical_path,
+        stable_id=image.stable_id,
+        parent_stable_id=image.parent_stable_id,
+        permissions=NodePermissions(read=True, write_metadata=True, delete=True),
+        timestamps=image.timestamps,
+        metadata=image.metadata,
+        etag_or_version=image.etag_or_version,
+    )
+    service = PyFuseService(InMemoryBackend(nodes))
+    path = "/ee/projects/demo/assets/tile_001"
+    fh = 43
+    service.open_for_write(path, fh=fh)
+    payload = b'{"properties": {"system:index": "nope"}}'
+    service.truncate(path, fh=fh, length=0)
+    service.write(path, fh=fh, offset=0, data=payload)
+    try:
+        service.release_write(path, fh=fh)
+        raise AssertionError("expected FuseError")
+    except FuseError as exc:
+        assert exc.code == 13

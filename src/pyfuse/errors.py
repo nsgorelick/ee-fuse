@@ -37,5 +37,13 @@ def eagain(message: str) -> FuseError:
     return FuseError(errno.EAGAIN, message)
 
 
+def eexist(message: str) -> FuseError:
+    return FuseError(errno.EEXIST, message)
+
+
+def einval(message: str) -> FuseError:
+    return FuseError(errno.EINVAL, message)
+
+
 def enotsup(message: str) -> FuseError:
     return FuseError(errno.ENOTSUP, message)

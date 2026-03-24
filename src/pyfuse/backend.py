@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Protocol
 
-from .errors import eacces, enoent, enotdir
+from .errors import eacces, eexist, enoent, enotdir
 from .models import Node, NodePermissions, NodeType
 from .paths import normalize_path, split_parent
 
@@ -20,6 +20,8 @@ class Backend(Protocol):
     def unlink(self, path: str) -> None: ...
 
     def rmdir(self, path: str) -> None: ...
+
+    def update_properties(self, path: str, properties: dict[str, object]) -> Node: ...
 
 
 class InMemoryBackend(Backend):
@@ -62,7 +64,7 @@ class InMemoryBackend(Backend):
             raise enotdir(f"not a directory-like node: {parent_path}")
         target = normalize_path(parent.canonical_path.rstrip("/") + "/" + name)
         if target in self._nodes:
-            raise eacces(f"target exists: {target}")
+            raise eexist(f"target exists: {target}")
         node = Node(
             node_type=NodeType.DIRECTORY,
             display_name=name,
@@ -83,18 +85,58 @@ class InMemoryBackend(Backend):
         if not source.permissions.write_metadata:
             raise eacces(f"rename denied on node: {source_path}")
         if dest_path in self._nodes:
-            raise eacces(f"destination exists: {dest_path}")
+            raise eexist(f"destination exists: {dest_path}")
+        if source.is_directory_like and (dest_path == source_path or dest_path.startswith(source_path + "/")):
+            raise eacces(f"cannot move directory into itself: {source_path} -> {dest_path}")
         parent_path, leaf = split_parent(dest_path)
         self.get_node(parent_path)
-        updated = replace(
-            source,
-            canonical_path=dest_path,
-            display_name=leaf,
-            etag_or_version=f"{source.etag_or_version}-renamed",
-        )
-        self._nodes.pop(source_path, None)
-        self._nodes[dest_path] = updated
-        return updated
+        if not source.is_directory_like:
+            updated = replace(
+                source,
+                canonical_path=dest_path,
+                display_name=leaf,
+                etag_or_version=f"{source.etag_or_version}-renamed",
+            )
+            self._nodes.pop(source_path, None)
+            self._nodes[dest_path] = updated
+            return updated
+
+        # Move the full subtree when renaming directories.
+        impacted = {
+            path: node
+            for path, node in self._nodes.items()
+            if path == source_path or path.startswith(source_path + "/")
+        }
+        for old_path in impacted:
+            new_path = dest_path + old_path[len(source_path) :]
+            if new_path not in impacted and new_path in self._nodes:
+                raise eexist(f"destination exists: {new_path}")
+
+        moved_by_new_path: dict[str, Node] = {}
+        old_to_new: dict[str, str] = {}
+        for old_path, node in impacted.items():
+            new_path = dest_path + old_path[len(source_path) :]
+            old_to_new[old_path] = new_path
+            moved_by_new_path[new_path] = replace(
+                node,
+                canonical_path=new_path,
+                display_name=leaf if old_path == source_path else _basename(new_path),
+                etag_or_version=f"{node.etag_or_version}-renamed" if old_path == source_path else node.etag_or_version,
+            )
+
+        # Rewire parent_stable_id for moved descendants when parent is moved too.
+        for new_path, node in list(moved_by_new_path.items()):
+            if new_path == dest_path:
+                continue
+            parent_of_new, _ = split_parent(new_path)
+            parent_node = moved_by_new_path.get(parent_of_new)
+            if parent_node is not None:
+                moved_by_new_path[new_path] = replace(node, parent_stable_id=parent_node.stable_id)
+
+        for old_path in impacted:
+            self._nodes.pop(old_path, None)
+        self._nodes.update(moved_by_new_path)
+        return moved_by_new_path[dest_path]
 
     def unlink(self, path: str) -> None:
         node = self.get_node(path)
@@ -113,3 +155,20 @@ class InMemoryBackend(Backend):
         if self.list_children(path, offset=0, limit=1):
             raise eacces("directory not empty")
         self._nodes.pop(normalize_path(path), None)
+
+    def update_properties(self, path: str, properties: dict[str, object]) -> Node:
+        node = self.get_node(path)
+        if not node.permissions.write_metadata:
+            raise eacces(f"property update denied: {path}")
+        updated_meta = {**(node.metadata or {}), "properties": dict(properties)}
+        updated = replace(
+            node,
+            metadata=updated_meta,
+            etag_or_version=f"{node.etag_or_version}-props",
+        )
+        self._nodes[normalize_path(path)] = updated
+        return updated
+
+
+def _basename(path: str) -> str:
+    return path.rstrip("/").split("/")[-1] if path != "/" else ""
